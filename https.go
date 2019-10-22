@@ -15,9 +15,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
+	"time"
+	ntlmauth "github.com/anynines/go-ntlm-auth/ntlm"
 )
 
 type ConnectActionLiteral int
@@ -628,6 +629,103 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 		}
 	}
 	return nil
+}
+
+func (proxy *ProxyHttpServer) NewConnectDialToNTLMProxyWithHandler(https_proxy string, connectReqHandler func(req *http.Request)) func(network, addr string) (net.Conn, error) {
+        u, err := url.Parse(https_proxy)
+        if err != nil {
+                return nil
+        }
+        // NTLM only with http
+        if u.Scheme == "" || u.Scheme == "http" {
+                if strings.IndexRune(u.Host, ':') == -1 {
+                        u.Host += ":80"
+                }
+                return func(network, addr string) (net.Conn, error) {
+                        auth, authOk := ntlmauth.GetDefaultCredentialsAuth()
+                        if !authOk {
+                                return nil, errors.New("Failed to get NTLM default credentials auth")
+                        }
+                        negotiateMessageBytes, err := auth.GetNegotiateBytes()
+                        if err != nil {
+                                return nil, errors.New("Failed to get NTLM negotiaten bytes")
+                        }
+                        defer auth.ReleaseContext()
+
+                        negotiateMsg := base64.StdEncoding.EncodeToString(negotiateMessageBytes)
+
+                        hdr := make(http.Header)
+                        hdr.Set("Proxy-Connection", "Keep-Alive")
+                        hdr.Set("Proxy-Authorization", "NTLM "+negotiateMsg)
+                        connectReq := &http.Request{
+                                Method: "CONNECT",
+                                URL:    &url.URL{Opaque: addr},
+                                Host:   addr,
+                                Header: hdr,
+                        }
+                        if connectReqHandler != nil {
+                                connectReqHandler(connectReq)
+                        }
+                        dialContext := (&net.Dialer{
+                                KeepAlive: 30 * time.Second,
+                                Timeout:   30 * time.Second,
+                        }).DialContext
+                        c, err := dialContext(connectReq.Context(), "tcp", u.Host)
+                        //c, err := proxy.dial(network, u.Host)
+                        if err != nil {
+                                return nil, err
+                        }
+
+                        connectReq.Write(c)
+                        // Read response.
+                        // Okay to use and discard buffered reader here, because
+                        // TLS server will not speak until spoken to.
+                        br := bufio.NewReader(c)
+                        resp, err := http.ReadResponse(br, connectReq)
+                        if err != nil {
+                                c.Close()
+                                return nil, err
+                        }
+                        resp.Body.Close()
+                        if resp.StatusCode != 407 {
+                                f := strings.SplitN(resp.Status, " ", 2)
+                                return nil,  errors.New(f[1])
+                        }
+
+
+                        // decode challenge
+                        challengeMessage, err := ntlmauth.ParseChallengeResponse(resp.Header.Get("Proxy-Authenticate"))
+                        if err != nil {
+                                return nil, err
+                        }
+
+                        challengeBytes, err := auth.GetResponseBytes(challengeMessage)
+                        if err != nil {
+                                return nil, err
+                        }
+
+                        authMsg := base64.StdEncoding.EncodeToString(challengeBytes)
+                        hdr.Set("Proxy-Authorization", "NTLM "+authMsg)
+                        connectReq = &http.Request{
+                                Method: "CONNECT",
+                                URL:    &url.URL{Opaque: addr},
+                                Host:   addr,
+                                Header: hdr,
+                        }
+                        connectReq.Write(c)
+                        resp, err = http.ReadResponse(br, connectReq)
+                        if err != nil {
+                                return nil, err
+                        }
+                        if resp.StatusCode != 200 {
+                                f := strings.SplitN(resp.Status, " ", 2)
+                                return nil, errors.New(f[1])
+                        }
+
+                        return c, nil
+                }
+        }
+        return nil
 }
 
 func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls.Config, error) {
